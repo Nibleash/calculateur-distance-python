@@ -415,7 +415,7 @@ async def enrich_excel_bytes(excel_bytes, token: str):
     geocoded = dict([await _g(a) for a in addresses])
 
     out = df.copy()
-    out["Entreprise coords"] = out[entreprise_col].map(geocoded)
+    out["Adresse entreprise coords"] = out[entreprise_col].map(geocoded)
     out["Adresse employé coords"] = out[employe_col].map(geocoded)
 
     valid = [a for a in addresses if geocoded.get(a) is not None]
@@ -424,20 +424,13 @@ async def enrich_excel_bytes(excel_bytes, token: str):
         coords = [geocoded[a] for a in valid]
         m = await _matrix(coords, token)
         distances = m.get("distances")
-        durations = m.get("durations")
 
         i = out[entreprise_col].astype(str).map(idx)
         j = out[employe_col].astype(str).map(idx)
 
         if distances:
-            out["Distance trajet (km)"] = [
-                None if (ii != ii) or (jj != jj) else round(float(distances[int(ii)][int(jj)]) / 1000, 2)
-                for ii, jj in zip(i, j)
-            ]
-
-        if durations:
-            out["Durée trajet (min)"] = [
-                None if (ii != ii) or (jj != jj) else round(float(durations[int(ii)][int(jj)]) / 60, 1)
+            out["Distance trajet (m)"] = [
+                None if (ii != ii) or (jj != jj) else int(distances[int(ii)][int(jj)])
                 for ii, jj in zip(i, j)
             ]
 
