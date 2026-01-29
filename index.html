@@ -460,7 +460,6 @@ async def enrich_excel_bytes(excel_bytes, token: str):
             # Appel API Distance Matrix
             matrix = await _matrix(batch_coords, token)
             distances = matrix.get("distances", [])
-            durations = matrix.get("durations", [])
             
             # Mapper les distances pour ce batch
             batch_len = index_end - index_start
@@ -471,10 +470,6 @@ async def enrich_excel_bytes(excel_bytes, token: str):
                 if emp_index < len(distances) and ent_index < len(distances[emp_index]):
                     distance = distances[emp_index][ent_index]
                     out.at[index_start + i, "Distance trajet (m)"] = distance
-                    
-                if durations and emp_index < len(durations) and ent_index < len(durations[emp_index]):
-                    duration = durations[emp_index][ent_index]
-                    out.at[index_start + i, "Durée trajet (min)"] = duration
         
         index_start = index_end
 

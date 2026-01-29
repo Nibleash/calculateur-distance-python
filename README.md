@@ -17,7 +17,6 @@ Outil web pour enrichir vos fichiers Excel/CSV avec les distances à pied entre 
    - `Entreprise coords` → (longitude, latitude)
    - `Adresse employé coords` → (longitude, latitude)
    - `Distance trajet (km)` → distance arrondie à 2 décimales
-   - `Durée trajet (min)` → durée arrondie à 1 décimale
 
 ### Format d'entrée attendu
 
