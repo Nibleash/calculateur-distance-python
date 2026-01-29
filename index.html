@@ -400,33 +400,6 @@ async def _matrix(coords, token: str):
     r.raise_for_status()
     return await r.json()
 
-async def _matrix_chunked(coords, token: str):
-    """Appelle Distance Matrix par chunks de 25×25 et retourne la matrice complète."""
-    n = len(coords)
-    distances = [[None for _ in range(n)] for _ in range(n)]
-    
-    chunk_size = 25
-    for i_start in range(0, n, chunk_size):
-        i_end = min(i_start + chunk_size, n)
-        row_chunk = coords[i_start:i_end]
-        
-        for j_start in range(0, n, chunk_size):
-            j_end = min(j_start + chunk_size, n)
-            col_chunk = coords[j_start:j_end]
-            
-            # Construire coords pour l'appel (row_chunk + col_chunk)
-            chunk_coords = row_chunk + col_chunk
-            m = await _matrix(chunk_coords, token)
-            chunk_distances = m.get("distances", [])
-            
-            # Mapper les distances du chunk dans la matrice globale
-            for local_i, global_i in enumerate(range(i_start, i_end)):
-                for local_j, global_j in enumerate(range(j_start, j_end)):
-                    if local_i < len(chunk_distances) and local_j < len(chunk_distances[local_i]):
-                        distances[global_i][global_j] = chunk_distances[local_i][local_j]
-    
-    return distances
-
 async def enrich_excel_bytes(excel_bytes, token: str):
     df = pd.read_excel(io.BytesIO(bytes(excel_bytes)))
     entreprise_col = df.columns[0]
@@ -448,20 +421,43 @@ async def enrich_excel_bytes(excel_bytes, token: str):
     out["Adresse entreprise coords"] = out[entreprise_col].map(geocoded)
     out["Adresse employé coords"] = out[employe_col].map(geocoded)
 
-    # Étape 3: Distance matrix par chunks
-    valid = [a for a in addresses if geocoded.get(a) is not None]
-    if valid:
-        idx = {a: i for i, a in enumerate(valid)}
-        coords = [geocoded[a] for a in valid]
-        distances = await _matrix_chunked(coords, token)
+    # Étape 3: Distance matrix par batches de 25 coordonnées max
+    # 1. Récupérer toutes les paires de coordonnées valides (non nulles)
+    pairs = out[["Adresse entreprise coords", "Adresse employé coords"]].dropna().copy()
+    if not pairs.empty:
+        # 2. Créer une liste unique de toutes les coordonnées utilisées
+        all_coords = list({c for tup in pairs.itertuples(index=False, name=None) for c in tup})
+        # 3. Créer un mapping coordonnée -> index
+        coord_idx = {c: i for i, c in enumerate(all_coords)}
+        # 4. Préparer la matrice de distances
+        n = len(all_coords)
+        distances = [[None for _ in range(n)] for _ in range(n)]
 
-        i = out[entreprise_col].astype(str).map(idx)
-        j = out[employe_col].astype(str).map(idx)
+        # 5. Découper en batches de 25 et appeler l'API
+        for batch_start in range(0, n, 25):
+            batch_coords = all_coords[batch_start:batch_start+25]
+            # Appel API pour ce batch
+            m = await _matrix(batch_coords, token)
+            batch_distances = m.get("distances", [])
+            # Remplir la matrice globale
+            for i, row in enumerate(batch_distances):
+                for j, val in enumerate(row):
+                    global_i = batch_start + i
+                    global_j = batch_start + j
+                    if global_i < n and global_j < n:
+                        distances[global_i][global_j] = val
 
-        out["Distance trajet (m)"] = [
-            None if (ii != ii) or (jj != jj) else int(distances[int(ii)][int(jj)])
-            for ii, jj in zip(i, j)
-        ]
+        # 6. Mapper la distance pour chaque ligne du DataFrame
+        def get_dist(row):
+            c_from = row["Adresse entreprise coords"]
+            c_to = row["Adresse employé coords"]
+            i = coord_idx.get(c_from)
+            j = coord_idx.get(c_to)
+            if i is not None and j is not None:
+                d = distances[i][j]
+                return None if d is None else int(d)
+            return None
+        out["Distance trajet (m)"] = out.apply(get_dist, axis=1)
 
     buf = io.BytesIO()
     out.to_excel(buf, index=False)
