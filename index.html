@@ -372,13 +372,23 @@ await micropip.install('openpyxl')
 
         await pyodide.runPythonAsync(`
 import io
-import asyncio
+import re
 import pandas as pd
 from urllib.parse import quote
 from pyodide.http import pyfetch
 
 GEOCODING_BASE_URL = "https://api.mapbox.com/search/geocode/v6/forward"
 DISTANCE_MATRIX_BASE_URL = "https://api.mapbox.com/directions-matrix/v1/mapbox/walking/"
+
+def _clean_address(address: str) -> str:
+    """Supprime les numéros d'appartement, escalier, bâtiment, etc. d'une adresse."""
+    if not isinstance(address, str):
+        return address
+    address = re.sub(r"A(P)*P(AR)*T(EMENT)*\s\d+\s", "", address, flags=re.IGNORECASE)
+    address = re.sub(r"ESC(ALIER)*\s*[A-Z0-9]+\s", "", address, flags=re.IGNORECASE)
+    address = re.sub(r"BAT\s*[A-Z0-9]+\s", "", address, flags=re.IGNORECASE)
+    address = re.sub(r"L(O)*G(T)*\s[A-Z0-9]+\s", "", address, flags=re.IGNORECASE)
+    return address.strip()
 
 async def _geocode_one(address: str, token: str):
     url = f"{GEOCODING_BASE_URL}?q={quote(address)}&access_token={quote(token)}"
@@ -395,7 +405,7 @@ async def _geocode_one(address: str, token: str):
 async def _matrix(coords, token: str):
     """Appel Distance Matrix pour un chunk de coordonnées."""
     coords_str = ";".join(f"{lon},{lat}" for lon, lat in coords)
-    url = f"{DISTANCE_MATRIX_BASE_URL}{coords_str}?access_token={quote(token)}&annotations=distance"
+    url = f"{DISTANCE_MATRIX_BASE_URL}{coords_str}?access_token={quote(token)}&annotations=distance,duration"
     r = await pyfetch(url, method="GET")
     r.raise_for_status()
     return await r.json()
@@ -405,59 +415,77 @@ async def enrich_excel_bytes(excel_bytes, token: str):
     entreprise_col = df.columns[0]
     employe_col = df.columns[1]
 
-    # Étape 1: Géocoder toutes les adresses uniques
-    addr_series = pd.concat([df[entreprise_col], df[employe_col]], ignore_index=True).dropna().astype(str)
+    # Nettoyage des adresses
+    df_work = df.copy()
+    df_work[entreprise_col] = df_work[entreprise_col].astype(str).apply(_clean_address)
+    df_work[employe_col] = df_work[employe_col].astype(str).apply(_clean_address)
+
+    # Géocodage : récupérer toutes les adresses uniques
+    addr_series = (
+        pd.concat([df_work[entreprise_col], df_work[employe_col]], ignore_index=True)
+        .dropna()
+        .astype(str)
+    )
     addresses = [a for a in pd.unique(addr_series) if a]
+    
+    # Géocoder chaque adresse unique
+    geocoded = {}
+    for addr in addresses:
+        geocoded[addr] = await _geocode_one(addr, token)
 
-    sem = asyncio.Semaphore(10)
-    async def _g(a):
-        async with sem:
-            return a, await _geocode_one(a, token)
-
-    geocoded = dict([await _g(a) for a in addresses])
-
-    # Étape 2: Mapper les coordonnées
+    # Mapper les coordonnées au DataFrame
     out = df.copy()
-    out["Adresse entreprise coords"] = out[entreprise_col].map(geocoded)
+    out["Entreprise coords"] = out[entreprise_col].map(geocoded)
     out["Adresse employé coords"] = out[employe_col].map(geocoded)
 
-    # Étape 3: Distance matrix par batches de 25 coordonnées max
-    # 1. Récupérer toutes les paires de coordonnées valides (non nulles)
-    pairs = out[["Adresse entreprise coords", "Adresse employé coords"]].dropna().copy()
-    if not pairs.empty:
-        # 2. Créer une liste unique de toutes les coordonnées utilisées
-        all_coords = list({c for tup in pairs.itertuples(index=False, name=None) for c in tup})
-        # 3. Créer un mapping coordonnée -> index
-        coord_idx = {c: i for i, c in enumerate(all_coords)}
-        # 4. Préparer la matrice de distances
-        n = len(all_coords)
-        distances = [[None for _ in range(n)] for _ in range(n)]
+    # Distance matrix par batches manuels (comme dans le notebook)
+    out["Distance trajet (m)"] = None
+    out["Durée trajet (min)"] = None
+    
+    batch_size = 12  # Traiter 12 lignes à la fois
+    index_start = 0
+    
+    while index_start < len(out):
+        index_end = min(index_start + batch_size, len(out))
+        
+        # Construire la liste des coordonnées pour ce batch
+        batch_coords = []
+        batch_coords.extend(out["Adresse employé coords"][index_start:index_end].tolist())
+        batch_coords.extend(out["Entreprise coords"][index_start:index_end].tolist())
+        
+        # Filtrer les coordonnées nulles
+        batch_coords = [c for c in batch_coords if c is not None]
+        
+        if batch_coords:
+            # Appel API Distance Matrix
+            matrix = await _matrix(batch_coords, token)
+            distances = matrix.get("distances", [])
+            durations = matrix.get("durations", [])
+            
+            # Mapper les distances pour ce batch
+            batch_len = index_end - index_start
+            for i in range(batch_len):
+                emp_index = i
+                ent_index = i + batch_len
+                
+                if emp_index < len(distances) and ent_index < len(distances[emp_index]):
+                    distance = distances[emp_index][ent_index]
+                    out.at[index_start + i, "Distance trajet (m)"] = distance
+                    
+                if durations and emp_index < len(durations) and ent_index < len(durations[emp_index]):
+                    duration = durations[emp_index][ent_index]
+                    out.at[index_start + i, "Durée trajet (min)"] = duration
+        
+        index_start = index_end
 
-        # 5. Découper en batches de 25 et appeler l'API
-        for batch_start in range(0, n, 25):
-            batch_coords = all_coords[batch_start:batch_start+25]
-            # Appel API pour ce batch
-            m = await _matrix(batch_coords, token)
-            batch_distances = m.get("distances", [])
-            # Remplir la matrice globale
-            for i, row in enumerate(batch_distances):
-                for j, val in enumerate(row):
-                    global_i = batch_start + i
-                    global_j = batch_start + j
-                    if global_i < n and global_j < n:
-                        distances[global_i][global_j] = val
-
-        # 6. Mapper la distance pour chaque ligne du DataFrame
-        def get_dist(row):
-            c_from = row["Adresse entreprise coords"]
-            c_to = row["Adresse employé coords"]
-            i = coord_idx.get(c_from)
-            j = coord_idx.get(c_to)
-            if i is not None and j is not None:
-                d = distances[i][j]
-                return None if d is None else int(d)
-            return None
-        out["Distance trajet (m)"] = out.apply(get_dist, axis=1)
+    # Convertir m->km et s->min
+    out["Distance trajet (km)"] = out["Distance trajet (m)"].apply(
+        lambda m: None if m is None else round(float(m) / 1000, 2)
+    )
+    out["Durée trajet (min)"] = out["Durée trajet (min)"].apply(
+        lambda s: None if s is None else round(float(s) / 60, 1)
+    )
+    out = out.drop(columns=["Distance trajet (m)"])
 
     buf = io.BytesIO()
     out.to_excel(buf, index=False)
