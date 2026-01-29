@@ -393,17 +393,46 @@ async def _geocode_one(address: str, token: str):
     return float(lon), float(lat)
 
 async def _matrix(coords, token: str):
+    """Appel Distance Matrix pour un chunk de coordonnées."""
     coords_str = ";".join(f"{lon},{lat}" for lon, lat in coords)
-    url = f"{DISTANCE_MATRIX_BASE_URL}{coords_str}?access_token={quote(token)}&annotations=distance,duration"
+    url = f"{DISTANCE_MATRIX_BASE_URL}{coords_str}?access_token={quote(token)}&annotations=distance"
     r = await pyfetch(url, method="GET")
     r.raise_for_status()
     return await r.json()
+
+async def _matrix_chunked(coords, token: str):
+    """Appelle Distance Matrix par chunks de 25×25 et retourne la matrice complète."""
+    n = len(coords)
+    distances = [[None for _ in range(n)] for _ in range(n)]
+    
+    chunk_size = 25
+    for i_start in range(0, n, chunk_size):
+        i_end = min(i_start + chunk_size, n)
+        row_chunk = coords[i_start:i_end]
+        
+        for j_start in range(0, n, chunk_size):
+            j_end = min(j_start + chunk_size, n)
+            col_chunk = coords[j_start:j_end]
+            
+            # Construire coords pour l'appel (row_chunk + col_chunk)
+            chunk_coords = row_chunk + col_chunk
+            m = await _matrix(chunk_coords, token)
+            chunk_distances = m.get("distances", [])
+            
+            # Mapper les distances du chunk dans la matrice globale
+            for local_i, global_i in enumerate(range(i_start, i_end)):
+                for local_j, global_j in enumerate(range(j_start, j_end)):
+                    if local_i < len(chunk_distances) and local_j < len(chunk_distances[local_i]):
+                        distances[global_i][global_j] = chunk_distances[local_i][local_j]
+    
+    return distances
 
 async def enrich_excel_bytes(excel_bytes, token: str):
     df = pd.read_excel(io.BytesIO(bytes(excel_bytes)))
     entreprise_col = df.columns[0]
     employe_col = df.columns[1]
 
+    # Étape 1: Géocoder toutes les adresses uniques
     addr_series = pd.concat([df[entreprise_col], df[employe_col]], ignore_index=True).dropna().astype(str)
     addresses = [a for a in pd.unique(addr_series) if a]
 
@@ -414,25 +443,25 @@ async def enrich_excel_bytes(excel_bytes, token: str):
 
     geocoded = dict([await _g(a) for a in addresses])
 
+    # Étape 2: Mapper les coordonnées
     out = df.copy()
     out["Adresse entreprise coords"] = out[entreprise_col].map(geocoded)
     out["Adresse employé coords"] = out[employe_col].map(geocoded)
 
+    # Étape 3: Distance matrix par chunks
     valid = [a for a in addresses if geocoded.get(a) is not None]
     if valid:
         idx = {a: i for i, a in enumerate(valid)}
         coords = [geocoded[a] for a in valid]
-        m = await _matrix(coords, token)
-        distances = m.get("distances")
+        distances = await _matrix_chunked(coords, token)
 
         i = out[entreprise_col].astype(str).map(idx)
         j = out[employe_col].astype(str).map(idx)
 
-        if distances:
-            out["Distance trajet (m)"] = [
-                None if (ii != ii) or (jj != jj) else int(distances[int(ii)][int(jj)])
-                for ii, jj in zip(i, j)
-            ]
+        out["Distance trajet (m)"] = [
+            None if (ii != ii) or (jj != jj) else int(distances[int(ii)][int(jj)])
+            for ii, jj in zip(i, j)
+        ]
 
     buf = io.BytesIO()
     out.to_excel(buf, index=False)
