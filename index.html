@@ -377,114 +377,128 @@ import pandas as pd
 from urllib.parse import quote
 from pyodide.http import pyfetch
 
-GEOCODING_BASE_URL = "https://api.mapbox.com/search/geocode/v6/forward"
-DISTANCE_MATRIX_BASE_URL = "https://api.mapbox.com/directions-matrix/v1/mapbox/walking/"
+class DistanceCalculator:
+    """Calcule les distances à pied entre adresses (logique Mapbox)."""
+    
+    GEOCODING_URL = "https://api.mapbox.com/search/geocode/v6/forward"
+    DISTANCE_MATRIX_URL = "https://api.mapbox.com/directions-matrix/v1/mapbox/walking/"
 
-def _clean_address(address: str) -> str:
-    """Supprime les numéros d'appartement, escalier, bâtiment, etc. d'une adresse."""
-    if not isinstance(address, str):
-        return address
-    address = re.sub(r"A(P)*P(AR)*T(EMENT)*\s\d+\s", "", address, flags=re.IGNORECASE)
-    address = re.sub(r"ESC(ALIER)*\s*[A-Z0-9]+\s", "", address, flags=re.IGNORECASE)
-    address = re.sub(r"BAT\s*[A-Z0-9]+\s", "", address, flags=re.IGNORECASE)
-    address = re.sub(r"L(O)*G(T)*\s[A-Z0-9]+\s", "", address, flags=re.IGNORECASE)
-    return address.strip()
+    def __init__(self, token: str):
+        self.token = token
 
-async def _geocode_one(address: str, token: str):
-    url = f"{GEOCODING_BASE_URL}?q={quote(address)}&access_token={quote(token)}"
-    r = await pyfetch(url, method="GET")
-    if r.status != 200:
+    @staticmethod
+    def clean_address(address: str) -> str:
+        """Supprime apt, escalier, bâtiment, logement d'une adresse."""
+        if not isinstance(address, str):
+            return address
+        address = re.sub(r"A(P)*P(AR)*T(EMENT)*\\s\\d+\\s", "", address, flags=re.IGNORECASE)
+        address = re.sub(r"ESC(ALIER)*\\s*[A-Z0-9]+\\s", "", address, flags=re.IGNORECASE)
+        address = re.sub(r"BAT\\s*[A-Z0-9]+\\s", "", address, flags=re.IGNORECASE)
+        address = re.sub(r"L(O)*G(T)*\\s[A-Z0-9]+\\s", "", address, flags=re.IGNORECASE)
+        return address.strip()
+
+    async def geocode_address(self, address: str):
+        """Géocode une adresse et retourne (lon, lat) ou None."""
+        url = f"{self.GEOCODING_URL}?q={quote(address)}&access_token={quote(self.token)}"
+        try:
+            r = await pyfetch(url, method="GET")
+            if r.status == 200:
+                data = await r.json()
+                if data.get("features"):
+                    coords = data["features"][0]["geometry"]["coordinates"]
+                    return tuple(coords)
+        except:
+            pass
         return None
-    data = await r.json()
-    feats = data.get("features")
-    if not feats:
-        return None
-    lon, lat = feats[0]["geometry"]["coordinates"]
-    return float(lon), float(lat)
 
-async def _matrix(coords, token: str):
-    """Appel Distance Matrix pour un chunk de coordonnées."""
-    coords_str = ";".join(f"{lon},{lat}" for lon, lat in coords)
-    url = f"{DISTANCE_MATRIX_BASE_URL}{coords_str}?access_token={quote(token)}&annotations=distance,duration"
-    r = await pyfetch(url, method="GET")
-    r.raise_for_status()
-    return await r.json()
+    async def get_distances(self, coords):
+        """Appel API Distance Matrix."""
+        coords_str = ";".join(f"{lon},{lat}" for lon, lat in coords)
+        url = f"{self.DISTANCE_MATRIX_URL}{coords_str}?access_token={quote(self.token)}&annotations=distance"
+        r = await pyfetch(url, method="GET")
+        r.raise_for_status()
+        return await r.json()
+
+    async def enrich_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Enrichit le DataFrame avec les distances."""
+        entreprise_col = df.columns[0]
+        employe_col = df.columns[1]
+
+        # 1. Nettoyer colonnes
+        for col in [entreprise_col, employe_col]:
+            df[col] = df[col].astype(str).str.replace(
+                r"A(P)*P(AR)*T(EMENT)*\\s\\d+\\s", "", regex=True
+            )
+            df[col] = df[col].astype(str).str.replace(
+                r"ESC(ALIER)*\\s*[A-Z0-9]+\\s", "", regex=True
+            )
+            df[col] = df[col].astype(str).str.replace(
+                r"BAT\\s*[A-Z0-9]+\\s", "", regex=True
+            )
+            df[col] = df[col].astype(str).str.replace(
+                r"L(O)*G(T)*\\s[A-Z0-9]+\\s", "", regex=True
+            )
+
+        # 2. Géocoder adresses uniques
+        addresses = list(
+            pd.concat([df[entreprise_col], df[employe_col]], ignore_index=True)
+            .dropna()
+            .unique()
+        )
+
+        geocoded = {}
+        for addr in addresses:
+            geocoded[addr] = await self.geocode_address(addr)
+
+        out = df.copy()
+        out["Adresse entreprise coords"] = out[entreprise_col].map(geocoded)
+        out["Adresse employé coords"] = out[employe_col].map(geocoded)
+
+        # 3. Distances par batches
+        out["Distance trajet (m)"] = None
+
+        batch_size = 12
+        for index_start in range(0, len(out), batch_size):
+            index_end = min(index_start + batch_size, len(out))
+
+            batch_coords = []
+            batch_coords.extend(
+                out["Adresse employé coords"][index_start:index_end].tolist()
+            )
+            batch_coords.extend(
+                out["Adresse entreprise coords"][index_start:index_end].tolist()
+            )
+
+            batch_coords = [c for c in batch_coords if c is not None]
+            if not batch_coords:
+                continue
+
+            try:
+                matrix = await self.get_distances(batch_coords)
+                distances = matrix.get("distances", [])
+
+                batch_len = index_end - index_start
+                for i in range(batch_len):
+                    emp_idx = i
+                    ent_idx = i + batch_len
+
+                    if (distances and emp_idx < len(distances) and
+                        ent_idx < len(distances[emp_idx])):
+                        out.at[index_start + i, "Distance trajet (m)"] = distances[emp_idx][ent_idx]
+            except:
+                pass
+
+        return out.drop(columns=["Distance trajet (m)"])
 
 async def enrich_excel_bytes(excel_bytes, token: str):
+    """Point d'entrée : traite les bytes du fichier Excel."""
     df = pd.read_excel(io.BytesIO(bytes(excel_bytes)))
-    entreprise_col = df.columns[0]
-    employe_col = df.columns[1]
-
-    # Nettoyage des adresses
-    df_work = df.copy()
-    df_work[entreprise_col] = df_work[entreprise_col].astype(str).apply(_clean_address)
-    df_work[employe_col] = df_work[employe_col].astype(str).apply(_clean_address)
-
-    # Géocodage : récupérer toutes les adresses uniques
-    addr_series = (
-        pd.concat([df_work[entreprise_col], df_work[employe_col]], ignore_index=True)
-        .dropna()
-        .astype(str)
-    )
-    addresses = [a for a in pd.unique(addr_series) if a]
+    calc = DistanceCalculator(token)
+    result = await calc.enrich_dataframe(df)
     
-    # Géocoder chaque adresse unique
-    geocoded = {}
-    for addr in addresses:
-        geocoded[addr] = await _geocode_one(addr, token)
-
-    # Mapper les coordonnées au DataFrame
-    out = df.copy()
-    out["Entreprise coords"] = out[entreprise_col].map(geocoded)
-    out["Adresse employé coords"] = out[employe_col].map(geocoded)
-
-    # Distance matrix par batches manuels (comme dans le notebook)
-    out["Distance trajet (m)"] = None
-    out["Durée trajet (min)"] = None
-    
-    batch_size = 12  # Traiter 12 lignes à la fois
-    index_start = 0
-    
-    while index_start < len(out):
-        index_end = min(index_start + batch_size, len(out))
-        
-        # Construire la liste des coordonnées pour ce batch
-        batch_coords = []
-        batch_coords.extend(out["Adresse employé coords"][index_start:index_end].tolist())
-        batch_coords.extend(out["Entreprise coords"][index_start:index_end].tolist())
-        
-        # Filtrer les coordonnées nulles
-        batch_coords = [c for c in batch_coords if c is not None]
-        
-        if batch_coords:
-            # Appel API Distance Matrix
-            matrix = await _matrix(batch_coords, token)
-            distances = matrix.get("distances", [])
-            
-            # Mapper les distances pour ce batch
-            batch_len = index_end - index_start
-            for i in range(batch_len):
-                emp_index = i
-                ent_index = i + batch_len
-                
-                if emp_index < len(distances) and ent_index < len(distances[emp_index]):
-                    distance = distances[emp_index][ent_index]
-                    out.at[index_start + i, "Distance trajet (m)"] = distance
-        
-        index_start = index_end
-
-    # Convertir m->km et s->min
-    out["Distance trajet (km)"] = out["Distance trajet (m)"].apply(
-        lambda m: None if m is None else round(float(m) / 1000, 2)
-    )
-    out["Durée trajet (min)"] = out["Durée trajet (min)"].apply(
-        lambda s: None if s is None else round(float(s) / 60, 1)
-    )
-    out = out.drop(columns=["Distance trajet (m)"])
-
-    buf = io.BytesIO()
-    out.to_excel(buf, index=False)
-    return buf.getvalue()
+    output = io.BytesIO()
+    result.to_excel(output, index=False)
+    return output.getvalue()
 `);
 
         runBtn.disabled = false;

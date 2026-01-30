@@ -11,12 +11,13 @@ Outil web pour enrichir vos fichiers Excel/CSV avec les distances à pied entre 
 ### Workflow simplifié
 
 1. **Vous uploadez** un fichier Excel avec 2 colonnes d'adresses
-2. **Nous géocodons** chaque adresse unique → coordonnées (lon, lat)
-3. **Nous calculons** les distances à pied via Mapbox Distance Matrix API
-4. **Nous retournons** votre fichier enrichi avec 4 colonnes :
-   - `Entreprise coords` → (longitude, latitude)
+2. **Nous nettoyons** les adresses (suppression apt, escalier, bâtiment, etc.)
+3. **Nous géocodons** chaque adresse unique → coordonnées (lon, lat)
+4. **Nous calculons** les distances à pied par batches via Mapbox Distance Matrix API
+5. **Nous retournons** votre fichier enrichi avec 3 colonnes :
+   - `Adresse entreprise coords` → (longitude, latitude)
    - `Adresse employé coords` → (longitude, latitude)
-   - `Distance trajet (km)` → distance arrondie à 2 décimales
+   - `Distance trajet (m)` → distance à pied en mètres
 
 ### Format d'entrée attendu
 
@@ -60,33 +61,14 @@ Outil web pour enrichir vos fichiers Excel/CSV avec les distances à pied entre 
 
 ---
 
-## 📊 Optimisations
-
-- ✅ **Dédupliquées les adresses** → une seule requête par adresse unique
-- ✅ **Batches de 12 lignes** → limite les appels API
-- ✅ **Nettoyage automatique** des adresses (suppression des numéros d'appartement, escaliers, etc.)
-
----
-
-## 🌐 Déploiement sur GitHub Pages
-
-Pour déployer gratuitement :
-
-1. **Paramètres du repository** → Pages
-2. Source : `Deploy from a branch`
-3. Branch : `main` | Dossier : `/ (root)`
-4. URL : `https://{username}.github.io/{repo-name}`
-
----
-
 ## 🐛 Dépannage
 
 | Problème | Solution |
 |---|---|
 | **"Clé API Mapbox manquante"** | Vérifier que la clé est bien collée |
-| **"Aucune adresse géocodée"** | Vérifier le format (ex: "rue, code postal, ville") |
+| **Coordonnées nulles** | Format d'adresse invalide ou non reconnue par Mapbox (essayer : "rue, code postal, ville") |
 | **Fichier ne se télécharge pas** | Ouvrir F12, vérifier la console pour erreurs JS |
-| **Traitement lent** | Normal pour gros fichiers (appels API séquentiels) |
+| **Traitement lent** | Normal pour gros fichiers (géocodage séquentiel + appels API par batches de 12) |
 
 ---
 
