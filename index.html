@@ -488,7 +488,7 @@ class DistanceCalculator:
             except:
                 pass
 
-        return out.drop(columns=["Distance trajet (m)"])
+        return out
 
 async def enrich_excel_bytes(excel_bytes, token: str):
     """Point d'entrée : traite les bytes du fichier Excel."""
